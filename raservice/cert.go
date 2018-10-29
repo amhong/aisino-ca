@@ -1,13 +1,9 @@
 package raservice
 
 import (
-	"crypto"
+	"aisino-ca/utils"
 	"crypto/rand"
 	"crypto/rsa"
-	"fabricMgtApi/config"
-	"fabricMgtApi/utils/raservice"
-
-	"aisino-ca/utils"
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
@@ -22,15 +18,14 @@ func ApplyCertificate(url string, req *GenerateCertZzpt) (sigPemCert, encPemCert
 	req.Arg24 = tmpKeyBASE64
 
 	//申请证书
-	//url := "http://202.100.108.40:40001/XiZangCertServicesBeanService/XiZangCertServicesBean?wsdl"
-	service := NewXiZangCertServicesBean(url, false, nil)
+	service := NewXiZangCertServicesBean(url, true, nil)
 	respGenCert, err := service.GenerateCertZzpt(req)
 	if err != nil {
 		return "", "", "", fmt.Errorf("generate cert failed: %s", err.Error())
 	}
 
 	//解析xml响应数据
-	certResp := raservice.ApplyUpdateCertResp{}
+	certResp := ApplyUpdateCertResp{}
 	err = xml.Unmarshal([]byte(respGenCert.Return_), &certResp)
 	if err != nil {
 		return "", "", "", fmt.Errorf("unmarshal xml response failed: %s", err.Error())
@@ -55,109 +50,6 @@ func ApplyCertificate(url string, req *GenerateCertZzpt) (sigPemCert, encPemCert
 	sigPemCert, err = utils.ConvertCert(certResp.Scert)
 	if err != nil {
 		return "", "", "", fmt.Errorf("cnvert p7b cert to pem cert failed: %s", err.Error())
-	}
-
-	return
-}
-
-func UpdateCertificate(orgUrl string, req *UpdateCertV2, isDouble bool) (sigPemCert, encPemCert, encPemPrikey string, err error) {
-	service := NewXiZangCertServicesBean(orgUrl, false, nil)
-
-	certSn := req.Arg2 //证书序列号
-	operatorSn := config.GetOperatorSn()
-	privateKeyPem := config.GetOperatorPrikey()
-
-	//生成请求的签名参数:sig:约定原文的签名值，目前原文是"xzra"+"||"+sn+"||"+operSn五者的字符串拼接
-	sig, err := utils.RsaSign("xzra||"+certSn+"||"+operatorSn, privateKeyPem, crypto.SHA1)
-	if err != nil {
-		return "", "", "", err
-	}
-
-	//授权证书可以更新
-	reqModifyUpdateStatus := ModifyUpdateStatusV2{
-		Ns:   "com.aisino.hxra.client.services.XiZangCertServicesEndPoint",
-		Arg0: certSn,
-		Arg1: "1", //status:要修改的权限状态值。0表示拒绝更新，1表示允许更新
-		Arg2: operatorSn,
-		Arg3: sig,
-	}
-	respModifyUpdateStatus, err := service.ModifyUpdateStatusV2(&reqModifyUpdateStatus)
-	if err != nil {
-		return "", "", "", fmt.Errorf("ModifyUpdateStatusV2 failed: %s", err.Error())
-	}
-
-	//解析xml响应数据
-	resp := BaseResp{}
-	err = xml.Unmarshal([]byte(respModifyUpdateStatus.Return_), &resp)
-	if err != nil {
-		return "", "", "", fmt.Errorf("unmarshal xml response failed: %s", err.Error())
-	}
-	if resp.Status != "1" {
-		return "", "", "", fmt.Errorf("ModifyUpdateStatus failed: %s", resp.Msg)
-	}
-
-	req.Arg0 = operatorSn
-
-	//生成请求的签名参数:sig:约定原文的签名值，目前是原文是"xzca"||sn||p10String
-	req.Arg5, err = utils.RsaSign("xzca||"+certSn+"||"+req.Arg1, privateKeyPem, crypto.SHA1)
-	if err != nil {
-		return "", "", "", err
-	}
-
-	//todo:双证书的更新，需要产生临时加密公钥：req.Arg4
-	var tmpRSAKey *rsa.PrivateKey
-	if isDouble { //申请双证书
-		//产生临时加密公钥: rsa1024
-		var err error
-		tmpRSAKey, err = rsa.GenerateKey(rand.Reader, 1024)
-		if err != nil {
-			return "", "", "", fmt.Errorf("generate template rsa key failed: %s", err.Error())
-		}
-
-		//编码公钥
-		pubKeyDerStream, err := utils.MarshalPublicKey(&tmpRSAKey.PublicKey)
-		//x509.MarshalPKIXPublicKey(&tmpRSAKey.PublicKey)
-		if err != nil {
-			return "", "", "", fmt.Errorf("MarshalPKIXPublicKey failed: %s", err.Error())
-		}
-		for _, v := range pubKeyDerStream {
-			fmt.Printf("%02x ", v)
-		}
-		req.Arg4 = base64.StdEncoding.EncodeToString(pubKeyDerStream)
-	}
-
-	//更新证书
-	respUpdateCert, err := service.UpdateCertV2(req)
-	if err != nil {
-		return "", "", "", fmt.Errorf("update cert failed: %s", err.Error())
-	}
-
-	//解析xml响应数据
-	certResp := ApplyUpdateCertResp{}
-	err = xml.Unmarshal([]byte(respUpdateCert.Return_), &certResp)
-	if err != nil {
-		return "", "", "", fmt.Errorf("unmarshal xml response failed: %s", err.Error())
-	}
-	if certResp.Success == "0" {
-		return "", "", "", fmt.Errorf("apply cert failed: %s", certResp.Msg)
-	}
-
-	sigPemCert, err = utils.ConvertCert(certResp.Scert)
-	if err != nil {
-		return "", "", "", fmt.Errorf("convert p7b cert to pem cert failed: %s", err.Error())
-	}
-
-	//todo:双证书的需要用临时加密公钥(req.Arg4)解密加密私钥
-	if isDouble {
-		encPemCert, err = utils.ConvertCert(certResp.Dcert)
-		if err != nil {
-			return "", "", "", fmt.Errorf("cnvert p7b cert to pem cert failed: %s", err.Error())
-		}
-		//解析数字信封获取加密私钥
-		encPemPrikey, err = utils.BuildPriKey(certResp.EncryptedPrivateKey, certResp.EncryptedSessionKey, tmpRSAKey)
-		if err != nil {
-			return "", "", "", fmt.Errorf("unpack envelop failed: %s", err.Error())
-		}
 	}
 
 	return
